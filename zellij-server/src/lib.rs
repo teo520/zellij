@@ -1512,7 +1512,7 @@ pub fn start_server_impl(
                     let _ = os_input.send_to_client(
                         *client_id,
                         ServerToClientMsg::Exit {
-                            exit_reason: ExitReason::Normal,
+                            exit_reason: ExitReason::NormalDetached,
                         },
                     );
                     remove_client!(*client_id, os_input, session_state, session_data);
