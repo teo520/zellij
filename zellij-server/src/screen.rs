@@ -78,7 +78,7 @@ use crate::notifications::NotificationProtocol;
 use crate::os_input_output::ResizeCache;
 use crate::pane_groups::PaneGroups;
 use crate::panes::alacritty_functions::xparse_color;
-use crate::panes::grid::{namespace_notification_id, PendingNotification};
+use crate::panes::grid::{namespace_notification_id, Osc99PayloadType, PendingNotification};
 use crate::panes::nested_session_modal::GuestModalShortcuts;
 use crate::panes::terminal_character::AnsiCode;
 use crate::panes::terminal_pane::{BRACKETED_PASTE_BEGIN, BRACKETED_PASTE_END};
@@ -118,16 +118,14 @@ use crate::mobile_web::MobileWebPrefs;
 /// Returns Some((terminal_id, full_osc_bytes)) where full_osc_bytes is
 /// the complete reconstructed OSC 99 sequence with original identifier,
 /// ready to write to the pane's PTY.
-/// Denormalizes a namespaced OSC 99 response.
-///
-/// Parses the namespaced `i=p<N>[r][q].<original_id>` format and returns:
-/// - `pane_id`: the terminal pane that originated the notification
-/// - `app_wants_report`: `r` flag — app originally requested `a=report`
-/// - `is_query`: `q` flag — this was a capability query (`p=?`)
-/// - `restored_response_bytes`: the response with the original `i=` value restored
-pub(crate) fn denormalize_notification_response(
-    payload: &[u8],
-) -> Option<(u32, bool, bool, Vec<u8>)> {
+pub(crate) struct NotificationResponse {
+    pub terminal_id: u32,
+    pub forward_to_pane: bool,
+    pub focus_pane: bool,
+    pub bytes: Vec<u8>,
+}
+
+pub(crate) fn denormalize_notification_response(payload: &[u8]) -> Option<NotificationResponse> {
     let payload_str = str::from_utf8(payload).ok()?;
 
     // Split into metadata and response payload on first ';'
@@ -142,42 +140,62 @@ pub(crate) fn denormalize_notification_response(
     // Find the i= key in colon-separated metadata
     let mut terminal_id = None;
     let mut app_wants_report = false;
-    let mut is_query = false;
+    let mut payload_type = Osc99PayloadType::Other;
     let mut restored_parts = Vec::new();
 
     for kv in metadata.split(':') {
         if let Some(namespaced_value) = kv.strip_prefix("i=p") {
-            // Parse "p<N>[r][q].<original_id>"
             if let Some(dot_pos) = namespaced_value.find('.') {
                 let flags_part = namespaced_value.get(..dot_pos).unwrap_or_default();
                 let original_id = namespaced_value.get(dot_pos + 1..).unwrap_or_default();
-                let pane_id_str = flags_part.trim_end_matches(|c| c == 'r' || c == 'q');
-                let flag_chars = flags_part.get(pane_id_str.len()..).unwrap_or_default();
+                let digits = flags_part
+                    .find(|c: char| !c.is_ascii_digit())
+                    .unwrap_or(flags_part.len());
+                let pane_id_str = flags_part.get(..digits).unwrap_or_default();
+                let flag_chars = flags_part.get(digits..).unwrap_or_default();
                 if let Ok(pid) = pane_id_str.parse::<u32>() {
                     terminal_id = Some(pid);
                     app_wants_report = flag_chars.contains('r');
-                    is_query = flag_chars.contains('q');
-                    // Empty original_id means the app never sent an i= key;
-                    // don't inject one into the response
-                    if !original_id.is_empty() {
+                    if original_id.is_empty() {
+                        restored_parts.push("i=0".to_owned());
+                    } else {
                         restored_parts.push(format!("i={}", original_id));
                     }
                     continue;
                 }
             }
         }
+        if let Some(payload_value) = kv.strip_prefix("p=") {
+            payload_type = Osc99PayloadType::from_metadata_value(payload_value);
+        }
         restored_parts.push(kv.to_string());
     }
 
     let terminal_id = terminal_id?;
+    let response_payload = if payload_type == Osc99PayloadType::Alive {
+        let prefix_with_report = format!("p{}r.", terminal_id);
+        let prefix = format!("p{}.", terminal_id);
+        let alive_ids: Vec<&str> = response_payload
+            .trim_start_matches(';')
+            .split(',')
+            .filter_map(|id| {
+                id.strip_prefix(&prefix_with_report)
+                    .or_else(|| id.strip_prefix(&prefix))
+            })
+            .map(|id| if id.is_empty() { "0" } else { id })
+            .collect();
+        format!(";{}", alive_ids.join(","))
+    } else {
+        response_payload.to_owned()
+    };
     let restored_metadata = restored_parts.join(":");
     let full_response = format!("\x1b]99;{}{}\x1b\\", restored_metadata, response_payload);
-    Some((
+    Some(NotificationResponse {
         terminal_id,
-        app_wants_report,
-        is_query,
-        full_response.into_bytes(),
-    ))
+        forward_to_pane: app_wants_report || payload_type.is_control_request(),
+        focus_pane: !payload_type.is_control_request(),
+        bytes: full_response.into_bytes(),
+    })
 }
 
 /// Get the active tab and call a closure on it
@@ -436,6 +454,11 @@ pub enum ScreenInstruction {
     ScrollDownAt(Position, ClientId, Option<NotificationEnd>),
     ScrollToBottom(ClientId, Option<NotificationEnd>),
     ScrollToTop(ClientId, Option<NotificationEnd>),
+    ScrollToPreviousPrompt(ClientId, Option<NotificationEnd>),
+    ScrollToNextPrompt(ClientId, Option<NotificationEnd>),
+    SelectCommandAtScrollPosition(ClientId, Option<NotificationEnd>),
+    CopyLastCommandOutput(ClientId, Option<NotificationEnd>),
+    ClearCommandOutputFlash(PaneId),
     PageScrollUp(ClientId, Option<NotificationEnd>),
     PageScrollDown(ClientId, Option<NotificationEnd>),
     HalfPageScrollUp(ClientId, Option<NotificationEnd>),
@@ -779,6 +802,7 @@ pub enum ScreenInstruction {
         host_theme_dark: Option<Styling>,
         /// Resolved styling for `theme_light`. See `host_theme_dark`.
         host_theme_light: Option<Styling>,
+        explicit_theme_hue: Option<ThemeHue>,
         simplified_ui: bool,
         default_shell: Option<PathBuf>,
         pane_frame_style: PaneFrameStyle,
@@ -793,7 +817,9 @@ pub enum ScreenInstruction {
         default_editor: Option<PathBuf>,
         advanced_mouse_actions: bool,
         mouse_scroll_resize: bool,
+        scroll_mode_sync: bool,
         mouse_hover_effects: bool,
+        mouse_hover_tips: bool,
         visual_bell: bool,
         focus_follows_mouse: bool,
         mouse_click_through: bool,
@@ -1021,6 +1047,15 @@ impl From<&ScreenInstruction> for ScreenContext {
             ScreenInstruction::ScrollDown(..) => ScreenContext::ScrollDown,
             ScreenInstruction::ScrollToBottom(..) => ScreenContext::ScrollToBottom,
             ScreenInstruction::ScrollToTop(..) => ScreenContext::ScrollToTop,
+            ScreenInstruction::ScrollToPreviousPrompt(..) => ScreenContext::ScrollToPreviousPrompt,
+            ScreenInstruction::ScrollToNextPrompt(..) => ScreenContext::ScrollToNextPrompt,
+            ScreenInstruction::SelectCommandAtScrollPosition(..) => {
+                ScreenContext::SelectCommandAtScrollPosition
+            },
+            ScreenInstruction::CopyLastCommandOutput(..) => ScreenContext::CopyLastCommandOutput,
+            ScreenInstruction::ClearCommandOutputFlash(..) => {
+                ScreenContext::ClearCommandOutputFlash
+            },
             ScreenInstruction::PageScrollUp(..) => ScreenContext::PageScrollUp,
             ScreenInstruction::PageScrollDown(..) => ScreenContext::PageScrollDown,
             ScreenInstruction::HalfPageScrollUp(..) => ScreenContext::HalfPageScrollUp,
@@ -1544,7 +1579,9 @@ pub(crate) struct Screen {
     osc133_command_selection: bool,
     word_separators: String,
     mouse_scroll_resize: bool,
+    scroll_mode_sync: bool,
     mouse_hover_effects: bool,
+    mouse_hover_tips: bool,
     visual_bell: bool,
     focus_follows_mouse: bool,
     mouse_click_through: bool,
@@ -1581,6 +1618,9 @@ pub(crate) struct Screen {
     host_descend_keys: Vec<KeyWithModifier>,
     host_descended: bool,
     host_terminal_theme_mode: Option<HostTerminalThemeMode>,
+    last_host_reported_theme_mode: Option<HostTerminalThemeMode>,
+    theme_policy: ThemePolicy,
+    configured_explicit_theme_hue: Option<ThemeHue>,
     host_theme_dark_styling: Option<Styling>,
     host_theme_light_styling: Option<Styling>,
     nested_session_handling: NestedSessionHandling,
@@ -1591,6 +1631,12 @@ pub(crate) struct Screen {
     client_notification_protocols: HashMap<ClientId, NotificationProtocol>,
     host_notification_protocol: HostNotificationProtocol,
     client_host_terminal_env: HashMap<ClientId, BTreeMap<String, String>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThemePolicy {
+    Auto,
+    Pinned(HostTerminalThemeMode),
 }
 
 /// A pending forward waiting to be dispatched once the current in-flight
@@ -1673,7 +1719,9 @@ impl Screen {
         osc133_command_selection: bool,
         word_separators: String,
         mouse_scroll_resize: bool,
+        scroll_mode_sync: bool,
         mouse_hover_effects: bool,
+        mouse_hover_tips: bool,
         visual_bell: bool,
         focus_follows_mouse: bool,
         mouse_click_through: bool,
@@ -1741,7 +1789,9 @@ impl Screen {
             osc133_command_selection,
             word_separators,
             mouse_scroll_resize,
+            scroll_mode_sync,
             mouse_hover_effects,
+            mouse_hover_tips,
             visual_bell,
             focus_follows_mouse,
             mouse_click_through,
@@ -1775,6 +1825,9 @@ impl Screen {
             host_descend_keys: vec![],
             host_descended: false,
             host_terminal_theme_mode: None,
+            last_host_reported_theme_mode: None,
+            theme_policy: ThemePolicy::Auto,
+            configured_explicit_theme_hue: None,
             host_theme_dark_styling: None,
             host_theme_light_styling: None,
             nested_session_handling,
@@ -1860,6 +1913,7 @@ impl Screen {
             .next()
             .context("screen contained no tabs")
             .with_context(err_context)?;
+        let mut arriving_client_ids: HashMap<usize, Vec<ClientId>> = HashMap::new();
         for (client_id, client_mode_info) in client_ids_and_mode_infos {
             let client_tab_history = self.tab_history.entry(client_id).or_insert_with(Vec::new);
             if let Some(client_previous_tab) = client_tab_history.pop() {
@@ -1868,6 +1922,10 @@ impl Screen {
                     client_active_tab
                         .add_client(client_id, Some(client_mode_info))
                         .with_context(err_context)?;
+                    arriving_client_ids
+                        .entry(client_previous_tab)
+                        .or_default()
+                        .push(client_id);
                     continue;
                 }
             }
@@ -1877,6 +1935,27 @@ impl Screen {
                 .with_context(err_context)?
                 .add_client(client_id, Some(client_mode_info))
                 .with_context(err_context)?;
+            arriving_client_ids
+                .entry(first_tab_index)
+                .or_default()
+                .push(client_id);
+        }
+        let destinations_overflowed_by_arriving_clients: HashSet<usize> = arriving_client_ids
+            .iter()
+            .filter(|(destination_tab_id, client_ids)| {
+                self.clients_are_larger_than_tab(**destination_tab_id, client_ids)
+            })
+            .map(|(destination_tab_id, _client_ids)| *destination_tab_id)
+            .collect();
+        for destination_tab_id in arriving_client_ids.keys() {
+            if let Some(destination_tab) = self.tabs.get_mut(destination_tab_id) {
+                destination_tab
+                    .update_input_modes()
+                    .with_context(err_context)?;
+                if destinations_overflowed_by_arriving_clients.contains(destination_tab_id) {
+                    destination_tab.set_should_clear_display_before_rendering();
+                }
+            }
         }
         Ok(())
     }
@@ -1921,6 +2000,12 @@ impl Screen {
             .map(|t| t.drain_connected_clients(clients_to_move));
 
         if let Some(client_mode_info_in_source_tab) = drained_clients {
+            let arriving_client_ids: Vec<ClientId> = client_mode_info_in_source_tab
+                .iter()
+                .map(|(client_id, _mode_info)| *client_id)
+                .collect();
+            let arriving_clients_overflow_destination =
+                self.clients_are_larger_than_tab(destination_tab_index, &arriving_client_ids);
             let destination_tab = self
                 .get_indexed_tab_mut(destination_tab_index)
                 .context("failed to get destination tab by index")
@@ -1934,7 +2019,7 @@ impl Screen {
                     .with_context(err_context)?;
             }
             destination_tab.set_force_render();
-            if destination_tab.has_stack_lists() {
+            if destination_tab.has_stack_lists() || arriving_clients_overflow_destination {
                 destination_tab.set_should_clear_display_before_rendering();
             }
             destination_tab.visible(true).with_context(err_context)?;
@@ -2285,6 +2370,20 @@ impl Screen {
             .unwrap_or_else(|| self.size_for_client(Some(client_id)))
     }
 
+    fn clients_are_larger_than_tab(&self, tab_id: usize, client_ids: &[ClientId]) -> bool {
+        let Some(tab_size) = self.tabs.get(&tab_id).map(|tab| tab.size) else {
+            return false;
+        };
+        client_ids.iter().any(|client_id| {
+            self.client_sizes
+                .get(client_id)
+                .map(|client_size| {
+                    client_size.rows > tab_size.rows || client_size.cols > tab_size.cols
+                })
+                .unwrap_or(false)
+        })
+    }
+
     pub fn recompute_tab_size(&mut self, tab_id: usize) -> Result<()> {
         let err_context = || format!("failed to recompute size for tab {tab_id}");
 
@@ -2590,16 +2689,17 @@ impl Screen {
         &mut self,
         client_id: ClientId,
         pixel_dimensions: PixelDimensions,
-    ) {
+    ) -> bool {
+        let previous_character_cell_size = *self.character_cell_size.borrow();
         self.pixel_dimensions.merge(pixel_dimensions);
         if let Some(character_cell_size) = self.pixel_dimensions.character_cell_size {
             *self.character_cell_size.borrow_mut() = Some(character_cell_size);
         } else if let Some(text_area_size) = self.pixel_dimensions.text_area_size {
             let Some(client_size) = self.client_sizes.get(&client_id).copied() else {
-                return;
+                return false;
             };
             if client_size.rows == 0 || client_size.cols == 0 {
-                return;
+                return false;
             }
             let character_cell_size = SizeInPixels {
                 height: text_area_size.height / client_size.rows,
@@ -2607,6 +2707,15 @@ impl Screen {
             };
             *self.character_cell_size.borrow_mut() = Some(character_cell_size);
         }
+        *self.character_cell_size.borrow() != previous_character_cell_size
+    }
+
+    pub fn resize_pty_all_panes(&mut self) -> Result<()> {
+        for tab in self.tabs.values_mut() {
+            tab.resize_pty_all_panes()
+                .context("failed to re-apply pty sizes")?;
+        }
+        Ok(())
     }
 
     pub fn update_kitty_graphics_support(&mut self, client_id: ClientId, supported: bool) {
@@ -4320,6 +4429,24 @@ impl Screen {
         self.active_tab_ids.keys().next().copied()
     }
 
+    pub fn has_no_client_to_act_for(&self, client_id: ClientId) -> bool {
+        self.get_active_tab(client_id).is_err() && self.get_first_client_id().is_none()
+    }
+
+    pub fn report_no_client_to_act_for(
+        &self,
+        client_id: ClientId,
+        message: String,
+        completion_tx: Option<NotificationEnd>,
+    ) {
+        log::error!("{}", &message);
+        let _ = self.bus.senders.send_to_server(ServerInstruction::LogError(
+            vec![message],
+            client_id,
+            completion_tx,
+        ));
+    }
+
     /// Returns an immutable reference to this [`Screen`]'s previous active [`Tab`].
     /// Consumes the last entry in tab history.
     pub fn get_previous_tab(&mut self, client_id: ClientId) -> Result<Option<&Tab>> {
@@ -4457,6 +4584,8 @@ impl Screen {
                         PendingNotification::Osc99 {
                             payload,
                             terminator,
+                            wants_report,
+                            ..
                         },
                     ) => {
                         let (metadata, rest) = match payload.find(';') {
@@ -4466,12 +4595,16 @@ impl Screen {
                             ),
                             None => (payload.as_str(), ""),
                         };
-                        let namespaced_metadata = namespace_notification_id(metadata, pane_id);
+                        let namespaced_metadata =
+                            namespace_notification_id(metadata, pane_id, *wants_report);
                         Some(format!(
                             "\u{1b}]99;{}{}{}",
                             namespaced_metadata, rest, terminator
                         ))
                     },
+                    (_, PendingNotification::Osc99 { display, .. }) => display
+                        .as_ref()
+                        .and_then(|(title, body)| protocol.render(title, body)),
                     _ => {
                         let (title, body) = notification.title_and_body();
                         protocol.render(&title, &body)
@@ -4705,6 +4838,7 @@ impl Screen {
             self.advanced_mouse_actions,
             self.mouse_scroll_resize,
             self.mouse_hover_effects,
+            self.mouse_hover_tips,
             self.focus_follows_mouse,
             self.mouse_click_through,
             self.web_server_ip,
@@ -4782,6 +4916,13 @@ impl Screen {
                 .iter()
                 .map(|c| (*c, self.get_active_pane_id(c)))
                 .collect();
+        let mut vacated_tab_ids: Vec<usize> = passthrough_affected_client_ids
+            .iter()
+            .filter_map(|affected_client_id| self.active_tab_ids.get(affected_client_id).copied())
+            .filter(|vacated_tab_id| *vacated_tab_id != tab_id)
+            .collect();
+        vacated_tab_ids.sort_unstable();
+        vacated_tab_ids.dedup();
 
         // move the relevant clients out of the current tab and place them in the new one
         let drained_clients = if should_change_client_focus {
@@ -4848,12 +4989,11 @@ impl Screen {
                     client_id,
                     blocking_terminal,
                 )?;
-                tab.update_input_modes()?;
-
                 if let Some(drained_clients) = drained_clients {
                     tab.visible(true)?;
                     tab.add_multiple_clients(drained_clients)?;
                 }
+                tab.update_input_modes()?;
                 let tab_size = tab.size;
                 tab.resize_whole_tab(tab_size).with_context(err_context)?;
                 tab.set_force_render();
@@ -4868,6 +5008,10 @@ impl Screen {
         }
 
         self.recompute_tab_size(tab_id).with_context(err_context)?;
+        for vacated_tab_id in vacated_tab_ids {
+            self.recompute_tab_size(vacated_tab_id)
+                .with_context(err_context)?;
+        }
 
         for (affected_client_id, old_pane_id) in passthrough_old_focused_panes {
             let new_pane_id = self.get_active_pane_id(&affected_client_id);
@@ -4942,8 +5086,12 @@ impl Screen {
             .tabs
             .get_mut(&tab_index)
             .with_context(|| err_context(tab_index))?;
+        let tab_was_empty = tab.has_no_connected_clients();
         tab.add_client(client_id, None)
             .with_context(|| err_context(tab_index))?;
+        if tab_was_empty {
+            tab.visible(true).with_context(|| err_context(tab_index))?;
+        }
         if attach_to_first_tab_on_tiled_surface && tab.are_floating_panes_visible() {
             tab.hide_floating_panes();
         }
@@ -5913,6 +6061,9 @@ impl Screen {
     // under unlock-first), so a client in another mode (Pane, Tab, Search, ...) is never
     // pulled out of it. See #638.
     fn sync_scroll_mode_on_focus(&mut self, client_id: ClientId) -> Result<()> {
+        if !self.scroll_mode_sync {
+            return Ok(());
+        }
         // base_mode is the default config reloads keep current; .mode is the fallback.
         let default_mode = self
             .default_mode_info
@@ -5923,6 +6074,7 @@ impl Screen {
         }
         let current_mode = match self.mode_info.get(&client_id) {
             Some(mode_info) => mode_info.mode,
+            None if self.active_tab_ids.contains_key(&client_id) => default_mode,
             None => return Ok(()),
         };
         let active_pane_is_scrolled = self.active_pane_is_scrolled(client_id);
@@ -6428,7 +6580,7 @@ impl Screen {
                     .with_context(err_context)?;
                 (active_pane_id, active_pane, pane_to_break_is_floating)
             };
-            let update_mode_infos = false;
+            let update_mode_infos = true;
             match direction {
                 Direction::Right | Direction::Down => {
                     self.switch_tab_next(None, update_mode_infos, client_id)?;
@@ -6701,7 +6853,9 @@ impl Screen {
         default_editor: Option<PathBuf>,
         advanced_mouse_actions: bool,
         mouse_scroll_resize: bool,
+        scroll_mode_sync: bool,
         mouse_hover_effects: bool,
+        mouse_hover_tips: bool,
         visual_bell: bool,
         focus_follows_mouse: bool,
         mouse_click_through: bool,
@@ -6716,6 +6870,7 @@ impl Screen {
         self.arrow_fonts = should_support_arrow_fonts;
 
         // global configuration
+        self.style.colors = theme;
         self.default_mode_info.update_theme(theme);
         self.default_mode_info
             .update_rounded_corners(rounded_corners);
@@ -6732,7 +6887,9 @@ impl Screen {
         self.pane_frame_style = pane_frame_style;
         self.advanced_mouse_actions = advanced_mouse_actions;
         self.mouse_scroll_resize = mouse_scroll_resize;
+        self.scroll_mode_sync = scroll_mode_sync;
         self.mouse_hover_effects = mouse_hover_effects;
+        self.mouse_hover_tips = mouse_hover_tips;
         self.visual_bell = visual_bell;
         self.focus_follows_mouse = focus_follows_mouse;
         self.mouse_click_through = mouse_click_through;
@@ -6766,6 +6923,7 @@ impl Screen {
             tab.update_advanced_mouse_actions(advanced_mouse_actions);
             tab.update_mouse_scroll_resize(mouse_scroll_resize);
             tab.update_mouse_hover_effects(mouse_hover_effects);
+            tab.update_mouse_hover_tips(mouse_hover_tips);
             tab.update_focus_follows_mouse(focus_follows_mouse);
             tab.update_mouse_click_through(mouse_click_through);
             tab.update_selection_options(osc133_command_selection, self.word_separators.clone());
@@ -6804,16 +6962,14 @@ impl Screen {
         self.broadcast_nested_shortcuts();
         Ok(())
     }
-    /// Apply a host-reported color-palette theme mode (CSI 2031 / DSR 997).
-    ///
-    /// This is the Phase 2 entry-point: it
-    /// 1. de-duplicates against the last-known mode,
-    /// 2. swaps the active palette to the configured `theme_dark` / `theme_light`
-    ///    (when both are configured) by reusing the reconfigure propagation,
-    /// 3. fans out an `Event::HostTerminalThemeChanged` plugin event,
-    /// 4. forwards a `CSI ?997;{1|2}n` DSR onto the pty of every terminal pane
-    ///    whose app opted in via `CSI ? 2031 h`.
     pub fn update_host_terminal_theme_mode(&mut self, mode: HostTerminalThemeMode) -> Result<()> {
+        self.last_host_reported_theme_mode = Some(mode);
+        if matches!(self.theme_policy, ThemePolicy::Pinned(_)) {
+            return Ok(());
+        }
+        self.apply_theme_mode(mode)
+    }
+    fn apply_theme_mode(&mut self, mode: HostTerminalThemeMode) -> Result<()> {
         let err_context = || "Failed to update host terminal theme mode".to_string();
 
         // dedupe
@@ -6835,6 +6991,7 @@ impl Screen {
             self.host_theme_dark_styling.is_some() && self.host_theme_light_styling.is_some();
         if auto_switch_enabled {
             if let Some(theme) = resolved {
+                self.style.colors = theme;
                 self.default_mode_info.update_theme(theme);
                 for tab in self.tabs.values_mut() {
                     tab.update_theme(theme);
@@ -6932,7 +7089,52 @@ impl Screen {
             }
             return Ok(());
         }
-        self.update_host_terminal_theme_mode(mode)
+        self.theme_policy = ThemePolicy::Pinned(mode);
+        self.apply_theme_mode(mode)
+    }
+    fn resolve_default_theme_mode(&mut self) -> Result<()> {
+        if self.host_terminal_theme_mode.is_some() {
+            return Ok(());
+        }
+        if !matches!(self.theme_policy, ThemePolicy::Auto) {
+            return Ok(());
+        }
+        if self.host_theme_dark_styling.is_some() && self.host_theme_light_styling.is_some() {
+            self.apply_theme_mode(HostTerminalThemeMode::Dark)?;
+        }
+        Ok(())
+    }
+    fn reapply_effective_theme_mode(&mut self) -> Result<()> {
+        let known_mode = match self.theme_policy {
+            ThemePolicy::Pinned(mode) => Some(mode),
+            ThemePolicy::Auto => self.host_terminal_theme_mode,
+        };
+        if let Some(mode) = known_mode {
+            self.host_terminal_theme_mode = None;
+            self.apply_theme_mode(mode)?;
+        }
+        Ok(())
+    }
+    fn apply_configured_explicit_theme_hue(
+        &mut self,
+        explicit_theme_hue: Option<ThemeHue>,
+    ) -> Result<()> {
+        self.configured_explicit_theme_hue = explicit_theme_hue;
+        self.host_terminal_theme_mode = None;
+        match explicit_theme_hue {
+            Some(hue) => {
+                let mode = HostTerminalThemeMode::from(hue);
+                self.theme_policy = ThemePolicy::Pinned(mode);
+                self.apply_theme_mode(mode)
+            },
+            None => {
+                self.theme_policy = ThemePolicy::Auto;
+                match self.last_host_reported_theme_mode {
+                    Some(mode) => self.apply_theme_mode(mode),
+                    None => Ok(()),
+                }
+            },
+        }
     }
     pub fn toggle_pane_pinned(&mut self, client_id: ClientId) {
         active_tab_and_connected_client_id!(
@@ -7072,10 +7274,11 @@ impl Screen {
             .ok()
             .and_then(|tab| tab.get_active_pane_id(client_id));
         let active_pane_was_scrolled = self.active_pane_is_scrolled(client_id);
-        match self
-            .get_active_tab_mut(client_id)
-            .and_then(|tab| tab.handle_mouse_event(&event, client_id))
-        {
+        let passthrough_pane_id = active_pane_id_before
+            .filter(|pane_id| self.should_route_keys_to_pane(client_id, *pane_id));
+        match self.get_active_tab_mut(client_id).and_then(|tab| {
+            tab.handle_mouse_event_with_passthrough(&event, client_id, passthrough_pane_id)
+        }) {
             Ok(mouse_effect) => {
                 let mut should_render = false;
                 if let Some(pane_id) = mouse_effect.group_toggle {
@@ -7859,6 +8062,8 @@ pub(crate) fn screen_thread_main(
         );
     }
 
+    let explicit_theme_hue = config.options.explicit_theme_hue;
+
     let config_options = config.options;
     let host_notification_protocol = config_options
         .host_notification_protocol
@@ -7923,7 +8128,9 @@ pub(crate) fn screen_thread_main(
         .clone()
         .unwrap_or_else(|| DEFAULT_WORD_SEPARATORS.to_owned());
     let mouse_scroll_resize = config_options.mouse_scroll_resize.unwrap_or(true);
+    let scroll_mode_sync = config_options.scroll_mode_sync.unwrap_or(true);
     let mouse_hover_effects = config_options.mouse_hover_effects.unwrap_or(true);
+    let mouse_hover_tips = config_options.mouse_hover_tips.unwrap_or(true);
     let visual_bell = config_options.visual_bell.unwrap_or(true);
     let focus_follows_mouse = config_options.focus_follows_mouse.unwrap_or(false);
     let mouse_click_through = config_options.mouse_click_through.unwrap_or(false);
@@ -7973,7 +8180,9 @@ pub(crate) fn screen_thread_main(
         osc133_command_selection,
         word_separators,
         mouse_scroll_resize,
+        scroll_mode_sync,
         mouse_hover_effects,
+        mouse_hover_tips,
         visual_bell,
         focus_follows_mouse,
         mouse_click_through,
@@ -7985,6 +8194,13 @@ pub(crate) fn screen_thread_main(
     screen.host_theme_light_styling = host_theme_light_styling;
     screen.paste_buffer_read_enabled = dangerously_enable_paste_buffer_read;
     screen.set_host_notification_protocol(host_notification_protocol);
+    if explicit_theme_hue.is_some() {
+        screen
+            .apply_configured_explicit_theme_hue(explicit_theme_hue)
+            .non_fatal();
+    } else {
+        screen.resolve_default_theme_mode().non_fatal();
+    }
 
     let mut pending_tab_ids: HashSet<usize> = HashSet::new();
     let mut pending_tab_switches: HashSet<(usize, ClientId)> = HashSet::new(); // usize is the
@@ -9015,6 +9231,52 @@ pub(crate) fn screen_thread_main(
                 screen.sync_scroll_mode_if_scroll_changed(client_id, was_scrolled)?;
                 screen.render(None)?;
             },
+            ScreenInstruction::ScrollToPreviousPrompt(client_id, _completion_tx) => {
+                active_tab_and_connected_client_id!(
+                    screen,
+                    client_id,
+                    |tab: &mut Tab, client_id: ClientId| tab
+                        .scroll_active_terminal_to_previous_prompt(client_id)
+                );
+                screen.render(None)?;
+            },
+            ScreenInstruction::ScrollToNextPrompt(client_id, _completion_tx) => {
+                active_tab_and_connected_client_id!(
+                    screen,
+                    client_id,
+                    |tab: &mut Tab, client_id: ClientId| tab
+                        .scroll_active_terminal_to_next_prompt(client_id)
+                );
+                screen.render(None)?;
+            },
+            ScreenInstruction::SelectCommandAtScrollPosition(client_id, _completion_tx) => {
+                active_tab_and_connected_client_id!(
+                    screen,
+                    client_id,
+                    |tab: &mut Tab, client_id: ClientId| tab
+                        .select_command_at_scroll_position(client_id)
+                );
+                screen.render(None)?;
+            },
+            ScreenInstruction::CopyLastCommandOutput(client_id, _completion_tx) => {
+                active_tab_and_connected_client_id!(
+                    screen,
+                    client_id,
+                    |tab: &mut Tab, client_id: ClientId| tab.copy_last_command_output(client_id),
+                    ?
+                );
+                screen.render(None)?;
+            },
+            ScreenInstruction::ClearCommandOutputFlash(pane_id) => {
+                let all_tabs = screen.get_tabs_mut();
+                for tab in all_tabs.values_mut() {
+                    if tab.has_pane_with_pid(&pane_id) {
+                        tab.clear_command_output_flash(pane_id);
+                        break;
+                    }
+                }
+                screen.render(None)?;
+            },
             ScreenInstruction::MovePane(
                 client_id,
                 _completion_tx, // the action ends here, dropping this will release anything
@@ -9729,14 +9991,17 @@ pub(crate) fn screen_thread_main(
                     }
                 }
             },
-            ScreenInstruction::UpdateTabName(
-                c,
-                client_id,
-                _completion_tx, // the action ends here, dropping this will release anything
-                                // waiting for it
-            ) => {
-                screen.update_active_tab_name(c, client_id)?;
-                screen.render(None)?;
+            ScreenInstruction::UpdateTabName(c, client_id, completion_tx) => {
+                if screen.has_no_client_to_act_for(client_id) {
+                    screen.report_no_client_to_act_for(
+                        client_id,
+                        "Cannot rename the focused tab: no client is attached to this session. Target a tab explicitly with --tab-id.".to_owned(),
+                        completion_tx,
+                    );
+                } else {
+                    screen.update_active_tab_name(c, client_id)?;
+                    screen.render(None)?;
+                }
             },
             ScreenInstruction::UndoRenameTab(
                 client_id,
@@ -9784,7 +10049,11 @@ pub(crate) fn screen_thread_main(
                 }
             },
             ScreenInstruction::TerminalPixelDimensions(client_id, pixel_dimensions) => {
-                screen.update_pixel_dimensions(client_id, pixel_dimensions);
+                let character_cell_size_changed =
+                    screen.update_pixel_dimensions(client_id, pixel_dimensions);
+                if character_cell_size_changed {
+                    screen.resize_pty_all_panes()?;
+                }
             },
             ScreenInstruction::TerminalBackgroundColor(background_color_instruction) => {
                 screen.update_terminal_background_color(background_color_instruction);
@@ -10946,16 +11215,24 @@ pub(crate) fn screen_thread_main(
                 }
                 screen.log_and_report_session_state()?;
             },
-            ScreenInstruction::RenameActivePane(new_name, client_id, _completion_tx) => {
-                active_tab_and_connected_client_id!(
-                    screen,
-                    client_id,
-                    |tab: &mut Tab, client_id: ClientId| tab
-                        .rename_active_pane(new_name, client_id),
-                    ?
-                );
-                screen.render(None)?;
-                screen.log_and_report_session_state()?;
+            ScreenInstruction::RenameActivePane(new_name, client_id, completion_tx) => {
+                if screen.has_no_client_to_act_for(client_id) {
+                    screen.report_no_client_to_act_for(
+                        client_id,
+                        "Cannot rename the focused pane: no client is attached to this session. Target a pane explicitly with --pane-id.".to_owned(),
+                        completion_tx,
+                    );
+                } else {
+                    active_tab_and_connected_client_id!(
+                        screen,
+                        client_id,
+                        |tab: &mut Tab, client_id: ClientId| tab
+                            .rename_active_pane(new_name, client_id),
+                        ?
+                    );
+                    screen.render(None)?;
+                    screen.log_and_report_session_state()?;
+                }
             },
             ScreenInstruction::RenameTab(
                 tab_index,
@@ -11284,6 +11561,7 @@ pub(crate) fn screen_thread_main(
                 theme,
                 host_theme_dark,
                 host_theme_light,
+                explicit_theme_hue,
                 simplified_ui,
                 default_shell,
                 pane_frame_style,
@@ -11298,7 +11576,9 @@ pub(crate) fn screen_thread_main(
                 default_editor,
                 advanced_mouse_actions,
                 mouse_scroll_resize,
+                scroll_mode_sync,
                 mouse_hover_effects,
+                mouse_hover_tips,
                 visual_bell,
                 focus_follows_mouse,
                 mouse_click_through,
@@ -11329,7 +11609,9 @@ pub(crate) fn screen_thread_main(
                         default_editor,
                         advanced_mouse_actions,
                         mouse_scroll_resize,
+                        scroll_mode_sync,
                         mouse_hover_effects,
+                        mouse_hover_tips,
                         visual_bell,
                         focus_follows_mouse,
                         mouse_click_through,
@@ -11341,6 +11623,14 @@ pub(crate) fn screen_thread_main(
                         client_id,
                     )
                     .non_fatal();
+                if explicit_theme_hue != screen.configured_explicit_theme_hue {
+                    screen
+                        .apply_configured_explicit_theme_hue(explicit_theme_hue)
+                        .non_fatal();
+                } else {
+                    screen.reapply_effective_theme_mode().non_fatal();
+                }
+                screen.resolve_default_theme_mode().non_fatal();
             },
             ScreenInstruction::RerunCommandPane(terminal_pane_id, completion_tx) => {
                 screen.rerun_command_pane_with_id(terminal_pane_id, completion_tx)
@@ -11949,19 +12239,15 @@ pub(crate) fn screen_thread_main(
                 screen.render(None)?;
             },
             ScreenInstruction::DesktopNotificationResponse(raw_bytes, client_id) => {
-                if let Some((terminal_id, app_wants_report, is_query, rewritten_bytes)) =
-                    denormalize_notification_response(&raw_bytes)
-                {
-                    let pane_id = PaneId::Terminal(terminal_id);
-                    // Write response to the pane if the app expects it:
-                    // capability query answers (q flag) or activation reports (r flag)
-                    if app_wants_report || is_query {
+                if let Some(response) = denormalize_notification_response(&raw_bytes) {
+                    let pane_id = PaneId::Terminal(response.terminal_id);
+                    if response.forward_to_pane {
                         let all_tabs = screen.get_tabs_mut();
                         for tab in all_tabs.values_mut() {
                             if tab.has_pane_with_pid(&pane_id) {
                                 tab.write_to_pane_id(
                                     &None,
-                                    rewritten_bytes,
+                                    response.bytes,
                                     false,
                                     pane_id,
                                     None,
@@ -11972,8 +12258,7 @@ pub(crate) fn screen_thread_main(
                             }
                         }
                     }
-                    // Focus the pane on activation click (not on query responses)
-                    if !is_query {
+                    if response.focus_pane {
                         screen
                             .focus_pane_with_id(pane_id, false, false, client_id)
                             .non_fatal();

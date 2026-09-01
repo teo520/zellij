@@ -2,7 +2,7 @@ mod kdl_layout_parser;
 use crate::data::{
     BareKey, Direction, FloatingPaneCoordinates, InputMode, KeyWithModifier, LayoutInfo,
     LayoutMetadata, MultiplayerColors, Palette, PaletteColor, PaneId, PaneInfo, PaneManifest,
-    PermissionType, Resize, SessionInfo, StyleDeclaration, Styling, TabInfo, WebSharing,
+    PermissionType, Resize, SessionInfo, StyleDeclaration, Styling, TabInfo, ThemeHue, WebSharing,
     DEFAULT_STYLES,
 };
 use crate::envs::EnvironmentVariables;
@@ -60,6 +60,10 @@ macro_rules! parse_kdl_action_arguments {
                 "ScrollDown" => Ok(Action::ScrollDown),
                 "ScrollToBottom" => Ok(Action::ScrollToBottom),
                 "ScrollToTop" => Ok(Action::ScrollToTop),
+                "ScrollToPreviousPrompt" => Ok(Action::ScrollToPreviousPrompt),
+                "ScrollToNextPrompt" => Ok(Action::ScrollToNextPrompt),
+                "SelectCommandAtScrollPosition" => Ok(Action::SelectCommandAtScrollPosition),
+                "CopyLastCommandOutput" => Ok(Action::CopyLastCommandOutput),
                 "PageScrollUp" => Ok(Action::PageScrollUp),
                 "PageScrollDown" => Ok(Action::PageScrollDown),
                 "HalfPageScrollUp" => Ok(Action::HalfPageScrollUp),
@@ -744,6 +748,12 @@ impl Action {
             Action::ScrollDown => Some(KdlNode::new("ScrollDown")),
             Action::ScrollToBottom => Some(KdlNode::new("ScrollToBottom")),
             Action::ScrollToTop => Some(KdlNode::new("ScrollToTop")),
+            Action::ScrollToPreviousPrompt => Some(KdlNode::new("ScrollToPreviousPrompt")),
+            Action::ScrollToNextPrompt => Some(KdlNode::new("ScrollToNextPrompt")),
+            Action::SelectCommandAtScrollPosition => {
+                Some(KdlNode::new("SelectCommandAtScrollPosition"))
+            },
+            Action::CopyLastCommandOutput => Some(KdlNode::new("CopyLastCommandOutput")),
             Action::PageScrollUp => Some(KdlNode::new("PageScrollUp")),
             Action::PageScrollDown => Some(KdlNode::new("PageScrollDown")),
             Action::HalfPageScrollUp => Some(KdlNode::new("HalfPageScrollUp")),
@@ -1570,6 +1580,18 @@ impl TryFrom<(&KdlNode, &Options)> for Action {
                 parse_kdl_action_arguments!(action_name, action_arguments, kdl_action)
             },
             "ScrollToTop" => {
+                parse_kdl_action_arguments!(action_name, action_arguments, kdl_action)
+            },
+            "ScrollToPreviousPrompt" => {
+                parse_kdl_action_arguments!(action_name, action_arguments, kdl_action)
+            },
+            "ScrollToNextPrompt" => {
+                parse_kdl_action_arguments!(action_name, action_arguments, kdl_action)
+            },
+            "SelectCommandAtScrollPosition" => {
+                parse_kdl_action_arguments!(action_name, action_arguments, kdl_action)
+            },
+            "CopyLastCommandOutput" => {
                 parse_kdl_action_arguments!(action_name, action_arguments, kdl_action)
             },
             "PageScrollUp" => {
@@ -2761,6 +2783,16 @@ impl Options {
             .map(|(theme, _entry)| theme.to_string());
         let theme_light = kdl_property_first_arg_as_string_or_error!(kdl_options, "theme_light")
             .map(|(theme, _entry)| theme.to_string());
+        let explicit_theme_hue =
+            match kdl_property_first_arg_as_string_or_error!(kdl_options, "explicit_theme_hue") {
+                Some((string, entry)) => Some(ThemeHue::from_str(string).map_err(|_| {
+                    kdl_parsing_error!(
+                        format!("Invalid value for explicit_theme_hue: '{}'", string),
+                        entry
+                    )
+                })?),
+                None => None,
+            };
         let default_mode =
             match kdl_property_first_arg_as_string_or_error!(kdl_options, "default_mode") {
                 Some((string, entry)) => Some(InputMode::from_str(string).map_err(|_| {
@@ -2864,8 +2896,14 @@ impl Options {
         let mouse_scroll_resize =
             kdl_property_first_arg_as_bool_or_error!(kdl_options, "mouse_scroll_resize")
                 .map(|(v, _)| v);
+        let scroll_mode_sync =
+            kdl_property_first_arg_as_bool_or_error!(kdl_options, "scroll_mode_sync")
+                .map(|(v, _)| v);
         let mouse_hover_effects =
             kdl_property_first_arg_as_bool_or_error!(kdl_options, "mouse_hover_effects")
+                .map(|(v, _)| v);
+        let mouse_hover_tips =
+            kdl_property_first_arg_as_bool_or_error!(kdl_options, "mouse_hover_tips")
                 .map(|(v, _)| v);
         let web_server_ip =
             match kdl_property_first_arg_as_string_or_error!(kdl_options, "web_server_ip") {
@@ -2958,6 +2996,7 @@ impl Options {
             theme,
             theme_dark,
             theme_light,
+            explicit_theme_hue,
             default_mode,
             default_shell,
             default_cwd,
@@ -2994,7 +3033,9 @@ impl Options {
             show_release_notes,
             advanced_mouse_actions,
             mouse_scroll_resize,
+            scroll_mode_sync,
             mouse_hover_effects,
+            mouse_hover_tips,
             visual_bell,
             focus_follows_mouse,
             mouse_click_through,
@@ -3154,6 +3195,35 @@ impl Options {
             Some(node)
         } else if add_comments {
             let mut node = create_node("solarized-light");
+            node.set_leading(format!("{}\n// ", comment_text));
+            Some(node)
+        } else {
+            None
+        }
+    }
+    fn explicit_theme_hue_to_kdl(&self, add_comments: bool) -> Option<KdlNode> {
+        let comment_text = format!(
+            "{}\n{}\n{}\n{}\n{}",
+            " ",
+            "// Pin the session to a dark or light appearance, ignoring what the",
+            "// host terminal reports. When unset, the host terminal decides.",
+            "// Options: dark, light",
+            "// ",
+        );
+
+        let create_node = |hue: &ThemeHue| -> KdlNode {
+            let mut node = KdlNode::new("explicit_theme_hue");
+            node.push(format!("{}", hue));
+            node
+        };
+        if let Some(explicit_theme_hue) = &self.explicit_theme_hue {
+            let mut node = create_node(explicit_theme_hue);
+            if add_comments {
+                node.set_leading(format!("{}\n", comment_text));
+            }
+            Some(node)
+        } else if add_comments {
+            let mut node = create_node(&ThemeHue::Dark);
             node.set_leading(format!("{}\n// ", comment_text));
             Some(node)
         } else {
@@ -4282,6 +4352,60 @@ impl Options {
             None
         }
     }
+    fn scroll_mode_sync_to_kdl(&self, add_comments: bool) -> Option<KdlNode> {
+        let comment_text = format!(
+            "{}\n{}\n{}",
+            " ",
+            "// Whether scrolling a pane implicitly enters and exits Scroll mode",
+            "// default is true",
+        );
+
+        let create_node = |node_value: bool| -> KdlNode {
+            let mut node = KdlNode::new("scroll_mode_sync");
+            node.push(KdlValue::Bool(node_value));
+            node
+        };
+        if let Some(scroll_mode_sync) = self.scroll_mode_sync {
+            let mut node = create_node(scroll_mode_sync);
+            if add_comments {
+                node.set_leading(format!("{}\n", comment_text));
+            }
+            Some(node)
+        } else if add_comments {
+            let mut node = create_node(false);
+            node.set_leading(format!("{}\n// ", comment_text));
+            Some(node)
+        } else {
+            None
+        }
+    }
+    fn mouse_hover_tips_to_kdl(&self, add_comments: bool) -> Option<KdlNode> {
+        let comment_text = format!(
+            "{}\n{}\n{}",
+            " ",
+            "// Whether to show mouse hover help-text tips (resize help and group shortcuts)",
+            "// default is true",
+        );
+
+        let create_node = |node_value: bool| -> KdlNode {
+            let mut node = KdlNode::new("mouse_hover_tips");
+            node.push(KdlValue::Bool(node_value));
+            node
+        };
+        if let Some(mouse_hover_tips) = self.mouse_hover_tips {
+            let mut node = create_node(mouse_hover_tips);
+            if add_comments {
+                node.set_leading(format!("{}\n", comment_text));
+            }
+            Some(node)
+        } else if add_comments {
+            let mut node = create_node(false);
+            node.set_leading(format!("{}\n// ", comment_text));
+            Some(node)
+        } else {
+            None
+        }
+    }
     fn mouse_hover_effects_to_kdl(&self, add_comments: bool) -> Option<KdlNode> {
         let comment_text = format!(
             "{}\n{}\n{}",
@@ -4674,6 +4798,9 @@ impl Options {
         if let Some(theme_light_node) = self.theme_light_to_kdl(add_comments) {
             nodes.push(theme_light_node);
         }
+        if let Some(explicit_theme_hue_node) = self.explicit_theme_hue_to_kdl(add_comments) {
+            nodes.push(explicit_theme_hue_node);
+        }
         if let Some(default_mode) = self.default_mode_to_kdl(add_comments) {
             nodes.push(default_mode);
         }
@@ -4796,8 +4923,14 @@ impl Options {
         if let Some(mouse_scroll_resize) = self.mouse_scroll_resize_to_kdl(add_comments) {
             nodes.push(mouse_scroll_resize);
         }
+        if let Some(scroll_mode_sync) = self.scroll_mode_sync_to_kdl(add_comments) {
+            nodes.push(scroll_mode_sync);
+        }
         if let Some(mouse_hover_effects) = self.mouse_hover_effects_to_kdl(add_comments) {
             nodes.push(mouse_hover_effects);
+        }
+        if let Some(mouse_hover_tips) = self.mouse_hover_tips_to_kdl(add_comments) {
+            nodes.push(mouse_hover_tips);
         }
         if let Some(visual_bell) = self.visual_bell_to_kdl(add_comments) {
             nodes.push(visual_bell);
@@ -7602,6 +7735,90 @@ fn selection_options_default_to_none_when_unspecified() {
 }
 
 #[test]
+fn scroll_mode_sync_from_kdl() {
+    let fake_config = r##"
+        scroll_mode_sync false
+    "##;
+    let document: KdlDocument = fake_config.parse().unwrap();
+    let deserialized = Options::from_kdl(&document).unwrap();
+    assert_eq!(deserialized.scroll_mode_sync, Some(false));
+
+    let empty_document: KdlDocument = "".parse().unwrap();
+    let deserialized_empty = Options::from_kdl(&empty_document).unwrap();
+    assert_eq!(
+        deserialized_empty.scroll_mode_sync, None,
+        "an unspecified scroll_mode_sync stays None so the default applies"
+    );
+}
+
+#[test]
+fn scroll_mode_sync_round_trips_through_kdl() {
+    let fake_config = r##"
+        scroll_mode_sync false
+    "##;
+    let document: KdlDocument = fake_config.parse().unwrap();
+    let deserialized = Options::from_kdl(&document).unwrap();
+    let mut serialized = Options::to_kdl(&deserialized, false);
+    let mut fake_document = KdlDocument::new();
+    fake_document.nodes_mut().append(&mut serialized);
+    let deserialized_from_serialized =
+        Options::from_kdl(&fake_document.to_string().parse::<KdlDocument>().unwrap()).unwrap();
+    assert_eq!(
+        deserialized_from_serialized.scroll_mode_sync,
+        Some(false),
+        "scroll_mode_sync survives a serialize/parse round trip"
+    );
+}
+
+#[test]
+fn explicit_theme_hue_from_kdl() {
+    let fake_config = r##"
+        explicit_theme_hue "light"
+    "##;
+    let document: KdlDocument = fake_config.parse().unwrap();
+    let deserialized = Options::from_kdl(&document).unwrap();
+    assert_eq!(deserialized.explicit_theme_hue, Some(ThemeHue::Light));
+
+    let empty_document: KdlDocument = "".parse().unwrap();
+    let deserialized_empty = Options::from_kdl(&empty_document).unwrap();
+    assert_eq!(
+        deserialized_empty.explicit_theme_hue, None,
+        "an unspecified explicit_theme_hue leaves the host terminal in charge"
+    );
+}
+
+#[test]
+fn explicit_theme_hue_rejects_unknown_values() {
+    let fake_config = r##"
+        explicit_theme_hue "sepia"
+    "##;
+    let document: KdlDocument = fake_config.parse().unwrap();
+    assert!(
+        Options::from_kdl(&document).is_err(),
+        "only 'dark' and 'light' are accepted"
+    );
+}
+
+#[test]
+fn explicit_theme_hue_round_trips_through_kdl() {
+    let fake_config = r##"
+        explicit_theme_hue "dark"
+    "##;
+    let document: KdlDocument = fake_config.parse().unwrap();
+    let deserialized = Options::from_kdl(&document).unwrap();
+    let mut serialized = Options::to_kdl(&deserialized, false);
+    let mut fake_document = KdlDocument::new();
+    fake_document.nodes_mut().append(&mut serialized);
+    let deserialized_from_serialized =
+        Options::from_kdl(&fake_document.to_string().parse::<KdlDocument>().unwrap()).unwrap();
+    assert_eq!(
+        deserialized_from_serialized.explicit_theme_hue,
+        Some(ThemeHue::Dark),
+        "explicit_theme_hue survives a serialize/parse round trip"
+    );
+}
+
+#[test]
 fn config_options_to_string() {
     let fake_config = r##"
         simplified_ui true
@@ -7713,7 +7930,6 @@ fn config_options_to_string_without_options() {
     insta::assert_snapshot!(fake_document.to_string());
 }
 
-#[test]
 #[test]
 fn nested_session_handling_kdl_round_trip_for_every_variant() {
     use crate::input::options::NestedSessionHandling;
